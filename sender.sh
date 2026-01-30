@@ -115,21 +115,18 @@ wait_for_receiver() {
 start_weston_headless() {
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 
-    log "Starting weston headless compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
+    log "Starting weston PipeWire compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
 
-    # Write a minimal weston config
+    # Write a minimal weston config — pipewire backend outputs directly to PipeWire
     local cfg
     cfg=$(mktemp /tmp/weston-headless-XXXXX.ini)
     cat > "$cfg" <<WINI
-[core]
-modules=pipewire-plugin.so
-
 [output]
-name=headless
+name=pipewire
 mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
 WINI
 
-    weston --backend=headless --config="$cfg" --socket="$WESTON_SOCKET" &
+    weston --backend=pipewire --config="$cfg" --socket="$WESTON_SOCKET" 2>&1 &
     WESTON_PID=$!
     log "Weston PID: $WESTON_PID"
 
@@ -155,13 +152,14 @@ find_pipewire_video_node() {
 
     local node_id=""
     for i in $(seq 1 20); do
-        # pw-dump outputs JSON; find a Video/Source node from weston
+        # pw-dump outputs JSON; find the weston.pipewire video output node
         node_id=$(pw-dump 2>/dev/null \
             | python3 -c "
 import json, sys
 for obj in json.load(sys.stdin):
     props = obj.get('info', {}).get('props', {})
-    if props.get('media.class') == 'Video/Source':
+    mc = props.get('media.class', '')
+    if 'Video' in mc and 'weston' in props.get('node.name', ''):
         print(obj['id'])
         break
 " 2>/dev/null || true)
@@ -173,7 +171,7 @@ for obj in json.load(sys.stdin):
         fi
         sleep 0.5
     done
-    log "ERROR: No PipeWire video source node found."
+    log "ERROR: No PipeWire video node found from weston."
     exit 1
 }
 

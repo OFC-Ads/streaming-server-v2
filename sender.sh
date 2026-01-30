@@ -6,6 +6,7 @@ set -euo pipefail
 # Usage:
 #   ./sender.sh                             # defaults: portal capture, receiver at 192.168.86.33:9000
 #   STREAM_HOST=10.0.0.5 ./sender.sh       # override receiver address
+#   CAPTURE_METHOD=headless ./sender.sh     # headless: weston virtual display, no monitor needed (SSH-friendly)
 #   CAPTURE_METHOD=test ./sender.sh         # test pipeline without Waydroid (videotestsrc)
 #   CAPTURE_METHOD=x11grab DISPLAY=:0 ./sender.sh  # X11 fallback
 #
@@ -17,8 +18,26 @@ CAPTURE_METHOD="${CAPTURE_METHOD:-portal}"
 GAME_PACKAGE="${GAME_PACKAGE:-}"
 FRAMERATE="${FRAMERATE:-30}"
 BITRATE="${BITRATE:-4000}"
+HEADLESS_WIDTH="${HEADLESS_WIDTH:-1280}"
+HEADLESS_HEIGHT="${HEADLESS_HEIGHT:-720}"
+
+WESTON_PID=""
+WESTON_SOCKET="waydroid-stream"
 
 log() { echo "[sender] $(date +%T) $*"; }
+
+# ---------------------------------------------------------------------------
+# Cleanup — kill weston on exit if we started it
+# ---------------------------------------------------------------------------
+cleanup() {
+    log "Cleaning up..."
+    if [ -n "$WESTON_PID" ] && kill -0 "$WESTON_PID" 2>/dev/null; then
+        log "Stopping weston (PID $WESTON_PID)"
+        kill "$WESTON_PID" 2>/dev/null || true
+        wait "$WESTON_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Step 1 — Start Waydroid session
@@ -91,7 +110,94 @@ wait_for_receiver() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3b — Capture: PipeWire portal (primary, GNOME Wayland)
+# Step 3b — Headless: start Weston virtual compositor (no monitor needed)
+# ---------------------------------------------------------------------------
+start_weston_headless() {
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    log "Starting weston headless compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
+
+    # Write a minimal weston config
+    local cfg
+    cfg=$(mktemp /tmp/weston-headless-XXXXX.ini)
+    cat > "$cfg" <<WINI
+[core]
+modules=pipewire-plugin.so
+
+[output]
+name=headless
+mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
+WINI
+
+    weston --backend=headless --config="$cfg" --socket="$WESTON_SOCKET" &
+    WESTON_PID=$!
+    log "Weston PID: $WESTON_PID"
+
+    # Wait for the Wayland socket to appear
+    local socket_path="${XDG_RUNTIME_DIR}/${WESTON_SOCKET}"
+    for i in $(seq 1 20); do
+        if [ -e "$socket_path" ]; then
+            log "Weston socket ready: $socket_path"
+            export WAYLAND_DISPLAY="$WESTON_SOCKET"
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "ERROR: Weston socket did not appear at $socket_path"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 3b-2 — Headless: find the PipeWire video node weston created
+# ---------------------------------------------------------------------------
+find_pipewire_video_node() {
+    log "Looking for weston PipeWire video node..."
+
+    local node_id=""
+    for i in $(seq 1 20); do
+        # pw-dump outputs JSON; find a Video/Source node from weston
+        node_id=$(pw-dump 2>/dev/null \
+            | python3 -c "
+import json, sys
+for obj in json.load(sys.stdin):
+    props = obj.get('info', {}).get('props', {})
+    if props.get('media.class') == 'Video/Source':
+        print(obj['id'])
+        break
+" 2>/dev/null || true)
+
+        if [ -n "$node_id" ]; then
+            log "Found PipeWire video node: $node_id"
+            echo "$node_id"
+            return 0
+        fi
+        sleep 0.5
+    done
+    log "ERROR: No PipeWire video source node found."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 3b-3 — Capture: headless weston + PipeWire (no monitor, SSH-friendly)
+# ---------------------------------------------------------------------------
+capture_headless() {
+    local node_id
+    node_id=$(find_pipewire_video_node)
+
+    log "Starting GStreamer capture from PipeWire node $node_id"
+    exec gst-launch-1.0 -e \
+        pipewiresrc path="$node_id" do-timestamp=true keepalive-time=1000 ! \
+        videoconvert ! \
+        "video/x-raw,framerate=${FRAMERATE}/1" ! \
+        x264enc tune=zerolatency speed-preset=ultrafast \
+            bitrate="$BITRATE" key-int-max=60 bframes=0 byte-stream=true ! \
+        "video/x-h264,profile=baseline" ! \
+        mpegtsmux ! \
+        tcpclientsink host="$RECEIVER_HOST" port="$RECEIVER_PORT"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3c — Capture: PipeWire portal (primary, GNOME Wayland)
 # ---------------------------------------------------------------------------
 capture_portal() {
     log "Starting PipeWire portal capture..."
@@ -260,23 +366,32 @@ main() {
     log "Encode:   H.264 baseline, ${BITRATE} kbps, ${FRAMERATE} fps"
     echo
 
-    if [ "$CAPTURE_METHOD" != "test" ]; then
-        start_waydroid
-        sleep 2
-        launch_game
-        log "Waiting 10 seconds for the game to render..."
-        sleep 10
+    if [ "$CAPTURE_METHOD" = "test" ]; then
+        wait_for_receiver
+        capture_test
+        return
     fi
+
+    # Headless needs weston started BEFORE Waydroid
+    if [ "$CAPTURE_METHOD" = "headless" ]; then
+        start_weston_headless
+    fi
+
+    start_waydroid
+    sleep 2
+    launch_game
+    log "Waiting 10 seconds for the game to render..."
+    sleep 10
 
     wait_for_receiver
 
     case "$CAPTURE_METHOD" in
-        portal)   capture_portal   ;;
-        x11grab)  capture_x11grab  ;;
-        test)     capture_test     ;;
+        headless) capture_headless  ;;
+        portal)   capture_portal    ;;
+        x11grab)  capture_x11grab   ;;
         *)
             log "Unknown capture method: $CAPTURE_METHOD"
-            log "Available: portal, x11grab, test"
+            log "Available: headless, portal, x11grab, test"
             exit 1
             ;;
     esac

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# sender.sh — Start Waydroid, launch Empires & Puzzles, capture display, stream H.264 over TCP
+#
+# Usage:
+#   ./sender.sh                             # defaults: portal capture, receiver at 192.168.86.33:9000
+#   STREAM_HOST=10.0.0.5 ./sender.sh       # override receiver address
+#   CAPTURE_METHOD=test ./sender.sh         # test pipeline without Waydroid (videotestsrc)
+#   CAPTURE_METHOD=x11grab DISPLAY=:0 ./sender.sh  # X11 fallback
+#
+# Start the receiver FIRST, then run this script.
+
+RECEIVER_HOST="${STREAM_HOST:-192.168.86.33}"
+RECEIVER_PORT="${STREAM_PORT:-9000}"
+CAPTURE_METHOD="${CAPTURE_METHOD:-portal}"
+GAME_PACKAGE="${GAME_PACKAGE:-}"
+FRAMERATE="${FRAMERATE:-30}"
+BITRATE="${BITRATE:-4000}"
+
+log() { echo "[sender] $(date +%T) $*"; }
+
+# ---------------------------------------------------------------------------
+# Step 1 — Start Waydroid session
+# ---------------------------------------------------------------------------
+start_waydroid() {
+    log "Checking Waydroid status..."
+    if waydroid status 2>&1 | grep -q "RUNNING"; then
+        log "Waydroid session already running."
+        return 0
+    fi
+
+    log "Starting Waydroid session..."
+    waydroid session start &
+    disown
+
+    for i in $(seq 1 24); do
+        if waydroid status 2>&1 | grep -q "RUNNING"; then
+            log "Waydroid session is running."
+            return 0
+        fi
+        sleep 5
+    done
+    log "ERROR: Waydroid did not start within 2 minutes."
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 2 — Find & launch the game
+# ---------------------------------------------------------------------------
+launch_game() {
+    local pkg=""
+
+    # If the user supplied a package name, use it directly
+    if [ -n "$GAME_PACKAGE" ]; then
+        pkg="$GAME_PACKAGE"
+    else
+        # Search the app list for Empires & Puzzles
+        local listing
+        listing=$(waydroid app list 2>&1 || true)
+
+        # The listing format is "Name: <name>" on one line and "packageName: <pkg>" on the next.
+        pkg=$(echo "$listing" | awk '/[Ee]mpire/{getline; print $2}' | head -1)
+
+        if [ -z "$pkg" ]; then
+            # Try well-known package name
+            pkg="com.smallgiantgames.empires"
+        fi
+    fi
+
+    log "Launching package: $pkg"
+    if ! waydroid app launch "$pkg" 2>&1; then
+        log "WARNING: launch command returned an error — the game may still start."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Step 3a — Wait for the receiver to be reachable
+# ---------------------------------------------------------------------------
+wait_for_receiver() {
+    log "Checking receiver at $RECEIVER_HOST:$RECEIVER_PORT ..."
+    for i in $(seq 1 10); do
+        if (echo >/dev/tcp/"$RECEIVER_HOST"/"$RECEIVER_PORT") 2>/dev/null; then
+            log "Receiver is reachable."
+            return 0
+        fi
+        sleep 2
+    done
+    log "ERROR: Cannot reach receiver at $RECEIVER_HOST:$RECEIVER_PORT — is receiver.py running?"
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Step 3b — Capture: PipeWire portal (primary, GNOME Wayland)
+# ---------------------------------------------------------------------------
+capture_portal() {
+    log "Starting PipeWire portal capture..."
+    log "A screen-share dialog will appear — select the Waydroid window."
+    export STREAM_HOST STREAM_PORT FRAMERATE BITRATE
+
+    exec python3 - <<'PYEOF'
+"""Set up an xdg-desktop-portal ScreenCast session, obtain a PipeWire node,
+and exec into a GStreamer pipeline that encodes H.264 and streams MPEGTS
+over TCP to the receiver."""
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+import os, sys
+
+RECEIVER_HOST = os.environ.get("STREAM_HOST", "192.168.86.33")
+RECEIVER_PORT = os.environ.get("STREAM_PORT", "9000")
+FRAMERATE      = os.environ.get("FRAMERATE", "30")
+BITRATE        = os.environ.get("BITRATE", "4000")
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+loop = GLib.MainLoop()
+bus  = dbus.SessionBus()
+
+portal     = bus.get_object("org.freedesktop.portal.Desktop",
+                            "/org/freedesktop/portal/desktop")
+screencast = dbus.Interface(portal, "org.freedesktop.portal.ScreenCast")
+
+sender_name  = bus.get_unique_name().replace(".", "_").lstrip(":")
+token_serial = 0
+session_path = None
+
+def next_token():
+    global token_serial
+    token_serial += 1
+    return f"u{token_serial}"
+
+def request_path_for(token):
+    return f"/org/freedesktop/portal/desktop/request/{sender_name}/{token}"
+
+# ---------- Portal callback chain ----------
+def on_create_session(response, results):
+    global session_path
+    if response != 0:
+        print(f"[portal] CreateSession failed ({response})", file=sys.stderr)
+        loop.quit(); return
+    session_path = str(results["session_handle"])
+    print(f"[portal] Session: {session_path}", file=sys.stderr)
+
+    token = next_token()
+    bus.add_signal_receiver(on_select_sources, signal_name="Response",
+                            dbus_interface="org.freedesktop.portal.Request",
+                            path=request_path_for(token))
+    screencast.SelectSources(session_path, dbus.Dictionary({
+        "handle_token": dbus.String(token),
+        "types":    dbus.UInt32(1 | 2),   # monitor + window
+        "multiple": dbus.Boolean(False),
+    }, signature="sv"))
+
+def on_select_sources(response, results):
+    if response != 0:
+        print(f"[portal] SelectSources failed ({response})", file=sys.stderr)
+        loop.quit(); return
+    print("[portal] Sources selected — starting capture...", file=sys.stderr)
+
+    token = next_token()
+    bus.add_signal_receiver(on_start, signal_name="Response",
+                            dbus_interface="org.freedesktop.portal.Request",
+                            path=request_path_for(token))
+    screencast.Start(session_path, "", dbus.Dictionary({
+        "handle_token": dbus.String(token),
+    }, signature="sv"))
+
+def on_start(response, results):
+    if response != 0:
+        print(f"[portal] Start failed ({response})", file=sys.stderr)
+        loop.quit(); return
+
+    streams = results.get("streams", [])
+    if not streams:
+        print("[portal] No streams returned!", file=sys.stderr)
+        loop.quit(); return
+
+    node_id = str(streams[0][0])
+    print(f"[portal] PipeWire node: {node_id}", file=sys.stderr)
+
+    pw_fd = screencast.OpenPipeWireRemote(session_path,
+                dbus.Dictionary({}, signature="sv"))
+    fd = pw_fd.take()
+    os.set_inheritable(fd, True)
+    print(f"[portal] PipeWire fd: {fd}", file=sys.stderr)
+
+    cmd = [
+        "gst-launch-1.0", "-e",
+        "pipewiresrc", f"fd={fd}", f"path={node_id}",
+            "do-timestamp=true", "keepalive-time=1000",         "!",
+        "videoconvert",                                         "!",
+        f"video/x-raw,framerate={FRAMERATE}/1",                 "!",
+        "x264enc",
+            "tune=zerolatency",
+            "speed-preset=ultrafast",
+            f"bitrate={BITRATE}",
+            "key-int-max=60",
+            "bframes=0",
+            "byte-stream=true",                                 "!",
+        "video/x-h264,profile=baseline",                        "!",
+        "mpegtsmux",                                            "!",
+        "tcpclientsink", f"host={RECEIVER_HOST}", f"port={RECEIVER_PORT}",
+    ]
+    print(f"[portal] Launching: {' '.join(cmd)}", file=sys.stderr)
+    loop.quit()
+    os.execvp(cmd[0], cmd)
+
+# ---------- Kick off the chain ----------
+token = next_token()
+bus.add_signal_receiver(on_create_session, signal_name="Response",
+                        dbus_interface="org.freedesktop.portal.Request",
+                        path=request_path_for(token))
+
+screencast.CreateSession(dbus.Dictionary({
+    "handle_token":         dbus.String(token),
+    "session_handle_token": dbus.String("waydroid_stream"),
+}, signature="sv"))
+
+loop.run()
+PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Step 3c — Capture: x11grab (fallback for X11 sessions / Xwayland)
+# ---------------------------------------------------------------------------
+capture_x11grab() {
+    local display="${DISPLAY:-:0}"
+    log "Using x11grab capture on display $display"
+    exec ffmpeg -loglevel warning -stats \
+        -f x11grab -framerate "$FRAMERATE" -i "$display" \
+        -c:v libx264 -preset ultrafast -tune zerolatency \
+        -b:v "${BITRATE}k" -maxrate "${BITRATE}k" -bufsize "$((BITRATE * 2))k" \
+        -g 60 -bf 0 -profile:v baseline \
+        -f mpegts "tcp://${RECEIVER_HOST}:${RECEIVER_PORT}"
+}
+
+# ---------------------------------------------------------------------------
+# Step 3d — Capture: videotestsrc (for testing the pipeline end-to-end)
+# ---------------------------------------------------------------------------
+capture_test() {
+    log "Using videotestsrc (pipeline test — no Waydroid needed)"
+    exec gst-launch-1.0 -e \
+        videotestsrc pattern=ball is-live=true ! \
+        "video/x-raw,width=1280,height=720,framerate=${FRAMERATE}/1" ! \
+        videoconvert ! \
+        x264enc tune=zerolatency speed-preset=ultrafast \
+            bitrate="$BITRATE" key-int-max=60 bframes=0 byte-stream=true ! \
+        "video/x-h264,profile=baseline" ! \
+        mpegtsmux ! \
+        tcpclientsink host="$RECEIVER_HOST" port="$RECEIVER_PORT"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    log "=== Waydroid Game Streaming Pipeline ==="
+    log "Receiver: ${RECEIVER_HOST}:${RECEIVER_PORT}"
+    log "Capture:  ${CAPTURE_METHOD}"
+    log "Encode:   H.264 baseline, ${BITRATE} kbps, ${FRAMERATE} fps"
+    echo
+
+    if [ "$CAPTURE_METHOD" != "test" ]; then
+        start_waydroid
+        sleep 2
+        launch_game
+        log "Waiting 10 seconds for the game to render..."
+        sleep 10
+    fi
+
+    wait_for_receiver
+
+    case "$CAPTURE_METHOD" in
+        portal)   capture_portal   ;;
+        x11grab)  capture_x11grab  ;;
+        test)     capture_test     ;;
+        *)
+            log "Unknown capture method: $CAPTURE_METHOD"
+            log "Available: portal, x11grab, test"
+            exit 1
+            ;;
+    esac
+}
+
+main

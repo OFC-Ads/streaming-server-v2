@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # Start the receiver FIRST, then run this script.
 
-RECEIVER_HOST="${STREAM_HOST:-192.168.86.33}"
+RECEIVER_HOST="${STREAM_HOST:-192.168.86.29}"
 RECEIVER_PORT="${STREAM_PORT:-9000}"
 CAPTURE_METHOD="${CAPTURE_METHOD:-portal}"
 GAME_PACKAGE="${GAME_PACKAGE:-}"
@@ -107,16 +107,12 @@ launch_game() {
 # Step 3a — Wait for the receiver to be reachable
 # ---------------------------------------------------------------------------
 wait_for_receiver() {
-    log "Checking receiver at $RECEIVER_HOST:$RECEIVER_PORT (ping only)..."
-    for i in $(seq 1 10); do
-        if ping -c1 -W2 "$RECEIVER_HOST" >/dev/null 2>&1; then
-            log "Receiver host is reachable."
-            return 0
-        fi
-        sleep 2
-    done
-    log "ERROR: Cannot reach $RECEIVER_HOST — is the machine on the network?"
-    exit 1
+    log "Waiting for receiver at $RECEIVER_HOST:$RECEIVER_PORT ..."
+    # Skip the check — the receiver loops on connections now, so GStreamer
+    # can just connect directly. If the receiver isn't up, GStreamer will
+    # fail with a clear "connection refused" error.
+    log "Receiver check skipped (receiver handles reconnection)."
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -136,16 +132,21 @@ start_weston_headless() {
 
     log "Starting weston PipeWire compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
 
-    # Write a minimal weston config — pipewire backend outputs directly to PipeWire
+    # Headless backend provides a virtual display with GL (GPU) rendering.
+    # PipeWire backend adds a video output node we can capture with GStreamer.
     local cfg
     cfg=$(mktemp /tmp/weston-headless-XXXXX.ini)
     cat > "$cfg" <<WINI
+[output]
+name=headless
+mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
+
 [output]
 name=pipewire
 mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
 WINI
 
-    weston --backend=pipewire --config="$cfg" --socket="$WESTON_SOCKET" 2>&1 &
+    weston --backends=headless,pipewire --renderer=gl --config="$cfg" --socket="$WESTON_SOCKET" 2>&1 &
     WESTON_PID=$!
     log "Weston PID: $WESTON_PID"
 
@@ -404,6 +405,16 @@ main() {
     log "Launching Waydroid full UI..."
     waydroid show-full-ui &
     disown
+
+    # Wait for Android to be fully ready
+    log "Waiting for Android to be ready..."
+    for i in $(seq 1 30); do
+        if waydroid status 2>&1 | grep -q "Android.*ready"; then
+            log "Android is ready."
+            break
+        fi
+        sleep 2
+    done
     sleep 3
 
     launch_game

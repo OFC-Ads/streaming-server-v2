@@ -24,7 +24,7 @@ HEADLESS_HEIGHT="${HEADLESS_HEIGHT:-720}"
 WESTON_PID=""
 WESTON_SOCKET="waydroid-stream"
 
-log() { echo "[sender] $(date +%T) $*"; }
+log() { echo "[sender] $(date +%T) $*" >&2; }
 
 # ---------------------------------------------------------------------------
 # Cleanup — kill weston on exit if we started it
@@ -42,6 +42,16 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Step 1 — Start Waydroid session
 # ---------------------------------------------------------------------------
+restart_waydroid_session() {
+    # In headless mode, Waydroid must connect to the NEW weston compositor.
+    # A leftover session from a previous compositor won't render anything.
+    if waydroid status 2>&1 | grep -q "RUNNING"; then
+        log "Stopping stale Waydroid session..."
+        waydroid session stop 2>&1 || true
+        sleep 2
+    fi
+}
+
 start_waydroid() {
     log "Checking Waydroid status..."
     if waydroid status 2>&1 | grep -q "RUNNING"; then
@@ -97,15 +107,15 @@ launch_game() {
 # Step 3a — Wait for the receiver to be reachable
 # ---------------------------------------------------------------------------
 wait_for_receiver() {
-    log "Checking receiver at $RECEIVER_HOST:$RECEIVER_PORT ..."
+    log "Checking receiver at $RECEIVER_HOST:$RECEIVER_PORT (ping only)..."
     for i in $(seq 1 10); do
-        if (echo >/dev/tcp/"$RECEIVER_HOST"/"$RECEIVER_PORT") 2>/dev/null; then
-            log "Receiver is reachable."
+        if ping -c1 -W2 "$RECEIVER_HOST" >/dev/null 2>&1; then
+            log "Receiver host is reachable."
             return 0
         fi
         sleep 2
     done
-    log "ERROR: Cannot reach receiver at $RECEIVER_HOST:$RECEIVER_PORT — is receiver.py running?"
+    log "ERROR: Cannot reach $RECEIVER_HOST — is the machine on the network?"
     exit 1
 }
 
@@ -114,6 +124,15 @@ wait_for_receiver() {
 # ---------------------------------------------------------------------------
 start_weston_headless() {
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+    # Kill any leftover weston using our socket and clean stale files
+    local socket_path="${XDG_RUNTIME_DIR}/${WESTON_SOCKET}"
+    if [ -e "${socket_path}.lock" ]; then
+        log "Cleaning stale weston socket..."
+        pkill -f "weston.*${WESTON_SOCKET}" 2>/dev/null || true
+        sleep 1
+        rm -f "$socket_path" "${socket_path}.lock"
+    fi
 
     log "Starting weston PipeWire compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
 
@@ -186,6 +205,7 @@ capture_headless() {
     exec gst-launch-1.0 -e \
         pipewiresrc path="$node_id" do-timestamp=true keepalive-time=1000 ! \
         videoconvert ! \
+        videorate ! \
         "video/x-raw,framerate=${FRAMERATE}/1" ! \
         x264enc tune=zerolatency speed-preset=ultrafast \
             bitrate="$BITRATE" key-int-max=60 bframes=0 byte-stream=true ! \
@@ -370,13 +390,22 @@ main() {
         return
     fi
 
-    # Headless needs weston started BEFORE Waydroid
+    # Headless needs weston started BEFORE Waydroid, and any old
+    # Waydroid session must be stopped so it reconnects to the new compositor.
     if [ "$CAPTURE_METHOD" = "headless" ]; then
+        restart_waydroid_session
         start_weston_headless
     fi
 
     start_waydroid
     sleep 2
+
+    # Show the full Android UI inside the compositor
+    log "Launching Waydroid full UI..."
+    waydroid show-full-ui &
+    disown
+    sleep 3
+
     launch_game
     log "Waiting 10 seconds for the game to render..."
     sleep 10

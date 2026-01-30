@@ -75,17 +75,13 @@ def receive_stream(conn: socket.socket, save_file, ffplay_proc, start_time: floa
     return total_bytes
 
 
-def cleanup(conn, srv, save_file, ffplay_proc, total_bytes, start_time):
+def cleanup(conn, save_file, ffplay_proc, total_bytes, start_time):
     elapsed = time.monotonic() - start_time
     mb = total_bytes / (1024 * 1024)
     log(f"Total: {mb:.1f} MB in {elapsed:.0f}s")
 
     try:
         conn.close()
-    except Exception:
-        pass
-    try:
-        srv.close()
     except Exception:
         pass
 
@@ -130,41 +126,67 @@ def main():
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((args.host, args.port))
     srv.listen(1)
-    log("Waiting for sender to connect...")
-
-    conn, addr = srv.accept()
-    log(f"Sender connected: {addr[0]}:{addr[1]}")
-
-    save_file = open(args.save, "wb") if args.save else None
-
-    ffplay_proc = None
-    if args.play:
-        cmd = build_ffplay_cmd(args.ffplay_args)
-        log(f"Starting: {' '.join(cmd)}")
-        ffplay_proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-    start_time = time.monotonic()
-    total_bytes = 0
 
     def on_signal(sig, _frame):
         log("Interrupted — shutting down.")
-        cleanup(conn, srv, save_file, ffplay_proc, total_bytes, start_time)
+        srv.close()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
-    try:
-        total_bytes = receive_stream(conn, save_file, ffplay_proc, start_time)
-    except (ConnectionResetError, BrokenPipeError):
-        log("Connection lost.")
+    # Loop: accept connections, ignoring short-lived ones (e.g. health checks)
+    while True:
+        log("Waiting for sender to connect...")
+        conn, addr = srv.accept()
+        log(f"Sender connected: {addr[0]}:{addr[1]}")
 
-    cleanup(conn, srv, save_file, ffplay_proc, total_bytes, start_time)
+        # Peek at first data — skip connections that close immediately
+        conn.settimeout(10)
+        try:
+            first = conn.recv(65536)
+        except socket.timeout:
+            log("Connection timed out with no data — ignoring.")
+            conn.close()
+            continue
+        if not first:
+            log("Empty connection (health check?) — waiting for real sender.")
+            conn.close()
+            continue
+        conn.settimeout(None)
+
+        save_file = open(args.save, "wb") if args.save else None
+
+        ffplay_proc = None
+        if args.play:
+            cmd = build_ffplay_cmd(args.ffplay_args)
+            log(f"Starting: {' '.join(cmd)}")
+            ffplay_proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        start_time = time.monotonic()
+
+        # Write the first chunk we already read
+        total_bytes = len(first)
+        if save_file is not None:
+            save_file.write(first)
+        if ffplay_proc is not None and ffplay_proc.stdin:
+            try:
+                ffplay_proc.stdin.write(first)
+            except BrokenPipeError:
+                ffplay_proc = None
+
+        try:
+            total_bytes += receive_stream(conn, save_file, ffplay_proc, start_time)
+        except (ConnectionResetError, BrokenPipeError):
+            log("Connection lost.")
+
+        cleanup(conn, save_file, ffplay_proc, total_bytes, start_time)
+        log("Ready for next connection.\n")
 
 
 if __name__ == "__main__":

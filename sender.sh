@@ -132,21 +132,18 @@ start_weston_headless() {
 
     log "Starting weston PipeWire compositor (${HEADLESS_WIDTH}x${HEADLESS_HEIGHT})..."
 
-    # Headless backend provides a virtual display with GL (GPU) rendering.
-    # PipeWire backend adds a video output node we can capture with GStreamer.
+    # Single pipewire backend: Waydroid renders directly to the PipeWire output,
+    # so GStreamer's pipewiresrc can capture real frames. Dual-backend (headless+pipewire)
+    # doesn't work because windows only appear on the headless output.
     local cfg
     cfg=$(mktemp /tmp/weston-headless-XXXXX.ini)
     cat > "$cfg" <<WINI
-[output]
-name=headless
-mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
-
 [output]
 name=pipewire
 mode=${HEADLESS_WIDTH}x${HEADLESS_HEIGHT}
 WINI
 
-    weston --backends=headless,pipewire --renderer=gl --config="$cfg" --socket="$WESTON_SOCKET" 2>&1 &
+    weston --backend=pipewire --renderer=gl --config="$cfg" --socket="$WESTON_SOCKET" 2>&1 &
     WESTON_PID=$!
     log "Weston PID: $WESTON_PID"
 
@@ -202,15 +199,16 @@ capture_headless() {
     local node_id
     node_id=$(find_pipewire_video_node)
 
-    log "Starting GStreamer capture from PipeWire node $node_id"
+    local bitrate_bps=$((BITRATE * 1000))
+    log "Starting GStreamer capture from PipeWire node $node_id (HW encode)"
     exec gst-launch-1.0 -e \
         pipewiresrc path="$node_id" do-timestamp=true keepalive-time=1000 ! \
+        queue max-size-buffers=3 leaky=downstream ! \
         videoconvert ! \
         videorate ! \
-        "video/x-raw,framerate=${FRAMERATE}/1" ! \
-        x264enc tune=zerolatency speed-preset=ultrafast \
-            bitrate="$BITRATE" key-int-max=60 bframes=0 byte-stream=true ! \
-        "video/x-h264,profile=baseline" ! \
+        "video/x-raw,format=NV12,framerate=${FRAMERATE}/1" ! \
+        v4l2h264enc extra-controls="controls,video_bitrate=${bitrate_bps};" ! \
+        "video/x-h264,profile=baseline,stream-format=byte-stream" ! \
         mpegtsmux ! \
         tcpclientsink host="$RECEIVER_HOST" port="$RECEIVER_PORT"
 }
@@ -309,20 +307,16 @@ def on_start(response, results):
     os.set_inheritable(fd, True)
     print(f"[portal] PipeWire fd: {fd}", file=sys.stderr)
 
+    bitrate_bps = int(BITRATE) * 1000
     cmd = [
         "gst-launch-1.0", "-e",
         "pipewiresrc", f"fd={fd}", f"path={node_id}",
             "do-timestamp=true", "keepalive-time=1000",         "!",
         "videoconvert",                                         "!",
-        f"video/x-raw,framerate={FRAMERATE}/1",                 "!",
-        "x264enc",
-            "tune=zerolatency",
-            "speed-preset=ultrafast",
-            f"bitrate={BITRATE}",
-            "key-int-max=60",
-            "bframes=0",
-            "byte-stream=true",                                 "!",
-        "video/x-h264,profile=baseline",                        "!",
+        f"video/x-raw,format=NV12,framerate={FRAMERATE}/1",     "!",
+        "v4l2h264enc",
+            f"extra-controls=controls,video_bitrate={bitrate_bps};", "!",
+        f"video/x-h264,profile=baseline,stream-format=byte-stream", "!",
         "mpegtsmux",                                            "!",
         "tcpclientsink", f"host={RECEIVER_HOST}", f"port={RECEIVER_PORT}",
     ]
@@ -363,14 +357,15 @@ capture_x11grab() {
 # Step 3d — Capture: videotestsrc (for testing the pipeline end-to-end)
 # ---------------------------------------------------------------------------
 capture_test() {
-    log "Using videotestsrc (pipeline test — no Waydroid needed)"
+    local bitrate_bps=$((BITRATE * 1000))
+    log "Using videotestsrc (pipeline test — no Waydroid needed, HW encode)"
     exec gst-launch-1.0 -e \
         videotestsrc pattern=ball is-live=true ! \
         "video/x-raw,width=1280,height=720,framerate=${FRAMERATE}/1" ! \
         videoconvert ! \
-        x264enc tune=zerolatency speed-preset=ultrafast \
-            bitrate="$BITRATE" key-int-max=60 bframes=0 byte-stream=true ! \
-        "video/x-h264,profile=baseline" ! \
+        "video/x-raw,format=NV12" ! \
+        v4l2h264enc extra-controls="controls,video_bitrate=${bitrate_bps};" ! \
+        "video/x-h264,profile=baseline,stream-format=byte-stream" ! \
         mpegtsmux ! \
         tcpclientsink host="$RECEIVER_HOST" port="$RECEIVER_PORT"
 }
@@ -382,7 +377,7 @@ main() {
     log "=== Waydroid Game Streaming Pipeline ==="
     log "Receiver: ${RECEIVER_HOST}:${RECEIVER_PORT}"
     log "Capture:  ${CAPTURE_METHOD}"
-    log "Encode:   H.264 baseline, ${BITRATE} kbps, ${FRAMERATE} fps"
+    log "Encode:   H.264 baseline (v4l2 HW), ${BITRATE} kbps, ${FRAMERATE} fps"
     echo
 
     if [ "$CAPTURE_METHOD" = "test" ]; then

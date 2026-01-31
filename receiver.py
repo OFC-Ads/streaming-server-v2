@@ -28,7 +28,7 @@ def log(msg):
 def build_ffplay_cmd(extra_args: str) -> list[str]:
     cmd = [
         "ffplay",
-        "-fflags", "nobuffer",
+        "-fflags", "nobuffer+fastseek",
         "-flags", "low_delay",
         "-framedrop",
         "-analyzeduration", "100000",

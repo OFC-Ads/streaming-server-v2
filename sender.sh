@@ -9,6 +9,7 @@ set -euo pipefail
 #   CAPTURE_METHOD=headless ./sender.sh     # headless: weston virtual display, no monitor needed (SSH-friendly)
 #   CAPTURE_METHOD=test ./sender.sh         # test pipeline without Waydroid (videotestsrc)
 #   CAPTURE_METHOD=x11grab DISPLAY=:0 ./sender.sh  # X11 fallback
+#   INPUT_SERVER=0 ./sender.sh                     # disable input server
 #
 # Start the receiver FIRST, then run this script.
 
@@ -20,8 +21,11 @@ FRAMERATE="${FRAMERATE:-30}"
 BITRATE="${BITRATE:-4000}"
 HEADLESS_WIDTH="${HEADLESS_WIDTH:-1280}"
 HEADLESS_HEIGHT="${HEADLESS_HEIGHT:-720}"
+INPUT_SERVER="${INPUT_SERVER:-1}"
+INPUT_PORT="${INPUT_PORT:-9001}"
 
 WESTON_PID=""
+INPUT_SERVER_PID=""
 WESTON_SOCKET="waydroid-stream"
 
 log() { echo "[sender] $(date +%T) $*" >&2; }
@@ -31,6 +35,11 @@ log() { echo "[sender] $(date +%T) $*" >&2; }
 # ---------------------------------------------------------------------------
 cleanup() {
     log "Cleaning up..."
+    if [ -n "$INPUT_SERVER_PID" ] && kill -0 "$INPUT_SERVER_PID" 2>/dev/null; then
+        log "Stopping input_server (PID $INPUT_SERVER_PID)"
+        kill "$INPUT_SERVER_PID" 2>/dev/null || true
+        wait "$INPUT_SERVER_PID" 2>/dev/null || true
+    fi
     if [ -n "$WESTON_PID" ] && kill -0 "$WESTON_PID" 2>/dev/null; then
         log "Stopping weston (PID $WESTON_PID)"
         kill "$WESTON_PID" 2>/dev/null || true
@@ -101,6 +110,30 @@ launch_game() {
     if ! waydroid app launch "$pkg" 2>&1; then
         log "WARNING: launch command returned an error — the game may still start."
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Start input_server.py for receiving remote input events
+# ---------------------------------------------------------------------------
+start_input_server() {
+    if [ "$INPUT_SERVER" != "1" ]; then
+        log "Input server disabled (INPUT_SERVER=0)"
+        return 0
+    fi
+
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local server_script="${script_dir}/input_server.py"
+
+    if [ ! -f "$server_script" ]; then
+        log "WARNING: input_server.py not found at $server_script — skipping"
+        return 0
+    fi
+
+    log "Starting input server on port $INPUT_PORT..."
+    python3 "$server_script" --port "$INPUT_PORT" &
+    INPUT_SERVER_PID=$!
+    log "Input server PID: $INPUT_SERVER_PID"
 }
 
 # ---------------------------------------------------------------------------
@@ -379,6 +412,8 @@ main() {
     log "Capture:  ${CAPTURE_METHOD}"
     log "Encode:   H.264 baseline (v4l2 HW), ${BITRATE} kbps, ${FRAMERATE} fps"
     echo
+
+    start_input_server
 
     if [ "$CAPTURE_METHOD" = "test" ]; then
         wait_for_receiver
